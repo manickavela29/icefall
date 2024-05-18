@@ -80,6 +80,8 @@ import argparse
 import logging
 
 import torch
+from torch import Tensor, nn
+
 from onnx_pretrained import OnnxModel
 
 from icefall import is_module_available
@@ -88,6 +90,13 @@ from icefall import is_module_available
 def get_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument(
+        "--pt-filename",
+        required=True,
+        type=str,
+        help="Path to the pytorch model",
     )
 
     parser.add_argument(
@@ -122,7 +131,8 @@ def get_parser():
 
 
 def test_encoder(
-    torch_model: torch.jit.ScriptModule,
+    torch_model : nn.Module,
+    torch_jit_model: torch.jit.ScriptModule,
     onnx_model: OnnxModel,
 ):
     C = 80
@@ -135,18 +145,21 @@ def test_encoder(
         x_lens = torch.randint(low=30, high=T + 1, size=(N,))
         x_lens[0] = T
 
-        torch_encoder_out, torch_encoder_out_lens = torch_model.encoder(x, x_lens)
+        torch_encoder_out, torch_encoder_out_lens = torch_model.encoder(x,x_lens)
         torch_encoder_out = torch_model.joiner.encoder_proj(torch_encoder_out)
+
+        torch_jit_encoder_out, torch_jit_encoder_out_lens = torch_jit_model.encoder(x, x_lens)
+        torch_jit_encoder_out = torch_jit_model.joiner.encoder_proj(torch_jit_encoder_out)
 
         onnx_encoder_out, onnx_encoder_out_lens = onnx_model.run_encoder(x, x_lens)
 
-        assert torch.allclose(torch_encoder_out, onnx_encoder_out, atol=1e-05), (
-            (torch_encoder_out - onnx_encoder_out).abs().max()
+        assert torch.allclose(torch_jit_encoder_out, onnx_encoder_out, atol=1e-05), (
+            (torch_jit_encoder_out - onnx_encoder_out).abs().max()
         )
 
 
 def test_decoder(
-    torch_model: torch.jit.ScriptModule,
+    torch_jit_model: torch.jit.ScriptModule,
     onnx_model: OnnxModel,
 ):
     context_size = onnx_model.context_size
@@ -160,8 +173,8 @@ def test_decoder(
             size=(N, context_size),
             dtype=torch.int64,
         )
-        torch_decoder_out = torch_model.decoder(x, need_pad=torch.tensor([False]))
-        torch_decoder_out = torch_model.joiner.decoder_proj(torch_decoder_out)
+        torch_decoder_out = torch_jit_model.decoder(x, need_pad=torch.tensor([False]))
+        torch_decoder_out = torch_jit_model.joiner.decoder_proj(torch_decoder_out)
         torch_decoder_out = torch_decoder_out.squeeze(1)
 
         onnx_decoder_out = onnx_model.run_decoder(x)
@@ -171,21 +184,21 @@ def test_decoder(
 
 
 def test_joiner(
-    torch_model: torch.jit.ScriptModule,
+    torch_jit_model: torch.jit.ScriptModule,
     onnx_model: OnnxModel,
 ):
-    encoder_dim = torch_model.joiner.encoder_proj.weight.shape[1]
-    decoder_dim = torch_model.joiner.decoder_proj.weight.shape[1]
+    encoder_dim = torch_jit_model.joiner.encoder_proj.weight.shape[1]
+    decoder_dim = torch_jit_model.joiner.decoder_proj.weight.shape[1]
     for i in range(10):
         N = torch.randint(1, 100, size=(1,)).item()
         logging.info(f"test_joiner: iter {i}, N={N}")
         encoder_out = torch.rand(N, encoder_dim)
         decoder_out = torch.rand(N, decoder_dim)
 
-        projected_encoder_out = torch_model.joiner.encoder_proj(encoder_out)
-        projected_decoder_out = torch_model.joiner.decoder_proj(decoder_out)
+        projected_encoder_out = torch_jit_model.joiner.encoder_proj(encoder_out)
+        projected_decoder_out = torch_jit_model.joiner.decoder_proj(decoder_out)
 
-        torch_joiner_out = torch_model.joiner(encoder_out, decoder_out)
+        torch_joiner_out = torch_jit_model.joiner(encoder_out, decoder_out)
         onnx_joiner_out = onnx_model.run_joiner(
             projected_encoder_out, projected_decoder_out
         )
@@ -200,7 +213,9 @@ def main():
     args = get_parser().parse_args()
     logging.info(vars(args))
 
-    torch_model = torch.jit.load(args.jit_filename)
+    torch_model  = torch.load(args.pt_filename)
+
+    torch_jit_model = torch.jit.load(args.jit_filename)
 
     onnx_model = OnnxModel(
         encoder_model_filename=args.onnx_encoder_filename,
@@ -209,13 +224,13 @@ def main():
     )
 
     logging.info("Test encoder")
-    test_encoder(torch_model, onnx_model)
+    test_encoder(torch_model,torch_jit_model, onnx_model)
 
     logging.info("Test decoder")
-    test_decoder(torch_model, onnx_model)
+    test_decoder(torch_jit_model, onnx_model)
 
     logging.info("Test joiner")
-    test_joiner(torch_model, onnx_model)
+    test_joiner(torch_jit_model, onnx_model)
     logging.info("Finished checking ONNX models")
 
 
